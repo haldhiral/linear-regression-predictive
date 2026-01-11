@@ -1,0 +1,20 @@
+{
+  "model_version": "lr_profit_20260106_154518",
+  "trained_at": "2026-01-06T15:45:18.224995",
+  "rows_used": 22,
+  "features": [
+    "duration_days",
+    "seed_count",
+    "feed_cost",
+    "other_cost",
+    "last_avg_weight",
+    "last_death_count",
+    "pond_size"
+  ],
+  "target": "profit",
+  "metrics": {
+    "r2": -18.006893658561744,
+    "mae": 5886267.272218281,
+    "rmse": 10674372.413864583
+  }
+}
