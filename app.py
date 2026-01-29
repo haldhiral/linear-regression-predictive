@@ -1,18 +1,18 @@
 import os
 import json
 from datetime import datetime
-from typing import Optional, Dict, Any
+from typing import Dict, Any
 
 import pandas as pd
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy import create_engine, text
-from sklearn.model_selection import train_test_split
 from sklearn.pipeline import Pipeline
 from sklearn.compose import ColumnTransformer
 from sklearn.impute import SimpleImputer
-from sklearn.linear_model import LinearRegression
+from sklearn.linear_model import RidgeCV
 from sklearn.metrics import r2_score, mean_absolute_error, mean_squared_error
+from sklearn.preprocessing import StandardScaler
 import joblib
 import logging
 
@@ -44,10 +44,18 @@ FEATURE_COLS = [
     "duration_days",
     "seed_count",
     "feed_cost",
+    "feed_qty_raw",
     "other_cost",
     "last_avg_weight",
     "last_death_count",
+    "last_remaining_count",
     "pond_size",
+    "mortality_rate",
+    "survival_rate",
+    "feed_cost_per_seed",
+    "other_cost_per_seed",
+    "feed_qty_per_seed",
+    "seed_density",
 ]
 
 TARGET_COL = "profit"
@@ -86,22 +94,28 @@ logger = logging.getLogger("lele_ml_api")
 def load_training_dataset(min_rows: int = 10) -> pd.DataFrame:
     """
     Pull dataset from v_profit_dataset.
-    Require profit not null to train.
+    Require completed cycles (end_date set, revenue > 0) to train.
     """
     sql = text("""
         SELECT
             v.cycle_id,
+            v.end_date,
             v.duration_days,
             v.seed_count,
             v.feed_cost,
+            v.feed_qty_raw,
             v.other_cost,
             v.last_avg_weight,
             v.last_death_count,
+            v.last_remaining_count,
             p.ukuran AS pond_size,
+            v.revenue,
             v.profit
         FROM v_profit_dataset v
         JOIN ponds p ON p.id = v.pond_id
         WHERE v.profit IS NOT NULL
+          AND v.end_date IS NOT NULL
+          AND v.revenue > 0
           AND v.duration_days IS NOT NULL
     """)
     df = pd.read_sql(sql, engine)
@@ -126,9 +140,11 @@ def load_features_for_cycle(cycle_id: int) -> pd.DataFrame:
             v.duration_days,
             v.seed_count,
             v.feed_cost,
+            v.feed_qty_raw,
             v.other_cost,
             v.last_avg_weight,
             v.last_death_count,
+            v.last_remaining_count,
             p.ukuran AS pond_size
         FROM v_profit_dataset v
         JOIN ponds p ON p.id = v.pond_id
@@ -144,12 +160,32 @@ def load_features_for_cycle(cycle_id: int) -> pd.DataFrame:
 # =========================
 # ML helpers
 # =========================
+def safe_divide(numerator: pd.Series, denominator: pd.Series) -> pd.Series:
+    denominator = denominator.replace(0, pd.NA)
+    return numerator / denominator
+
+
+def prepare_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Build feature matrix with derived ratios.
+    """
+    feats = df.copy()
+    feats["mortality_rate"] = safe_divide(feats["last_death_count"], feats["seed_count"])
+    feats["survival_rate"] = safe_divide(feats["last_remaining_count"], feats["seed_count"])
+    feats["feed_cost_per_seed"] = safe_divide(feats["feed_cost"], feats["seed_count"])
+    feats["other_cost_per_seed"] = safe_divide(feats["other_cost"], feats["seed_count"])
+    feats["feed_qty_per_seed"] = safe_divide(feats["feed_qty_raw"], feats["seed_count"])
+    feats["seed_density"] = safe_divide(feats["seed_count"], feats["pond_size"])
+    return feats[FEATURE_COLS].apply(pd.to_numeric, errors="coerce")
+
+
 def build_pipeline() -> Pipeline:
     """
-    Simple Linear Regression with numeric imputation.
+    Regularized Linear Regression with numeric imputation.
     """
     numeric_transformer = Pipeline(steps=[
         ("imputer", SimpleImputer(strategy="median")),
+        ("scaler", StandardScaler()),
     ])
 
     preprocessor = ColumnTransformer(
@@ -159,7 +195,7 @@ def build_pipeline() -> Pipeline:
         remainder="drop"
     )
 
-    model = LinearRegression()
+    model = RidgeCV(alphas=[0.1, 1.0, 10.0, 100.0])
 
     pipe = Pipeline(steps=[
         ("preprocess", preprocessor),
@@ -203,15 +239,17 @@ def health():
 @app.post("/train", response_model=TrainResponse)
 def train():
     df = load_training_dataset(min_rows=10)
+    df = df.sort_values("end_date")
 
     # Training set
-    X = df[FEATURE_COLS].copy()
+    X = prepare_features(df)
     y = df[TARGET_COL].copy()
 
-    # Split for metrics
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.2, random_state=42
-    )
+    # Time-aware split for metrics
+    test_size = max(2, int(len(df) * 0.2))
+    train_size = len(df) - test_size
+    X_train, X_test = X.iloc[:train_size], X.iloc[train_size:]
+    y_train, y_test = y.iloc[:train_size], y.iloc[train_size:]
 
     pipe = build_pipeline()
     pipe.fit(X_train, y_train)
@@ -256,10 +294,10 @@ def predict(req: PredictRequest):
         raise HTTPException(status_code=404, detail=str(e))
 
     # Predict
-    X = feat_df[FEATURE_COLS].copy()
+    X = prepare_features(feat_df)
     yhat = float(pipe.predict(X)[0])
 
-    features_used = {col: (None if pd.isna(feat_df.iloc[0][col]) else float(feat_df.iloc[0][col]))
+    features_used = {col: (None if pd.isna(X.iloc[0][col]) else float(X.iloc[0][col]))
                      for col in FEATURE_COLS}
 
     logger.info(
