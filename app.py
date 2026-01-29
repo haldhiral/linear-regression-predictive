@@ -15,6 +15,7 @@ from sklearn.metrics import r2_score, mean_absolute_error, mean_squared_error
 from sklearn.preprocessing import StandardScaler
 import joblib
 import logging
+import sklearn
 
 
 # =========================
@@ -179,6 +180,50 @@ def prepare_features(df: pd.DataFrame) -> pd.DataFrame:
     return feats[FEATURE_COLS].apply(pd.to_numeric, errors="coerce")
 
 
+def log_model_environment(meta: dict | None = None) -> None:
+    logger.info("Model environment sklearn=%s pandas=%s", sklearn.__version__, pd.__version__)
+    if not meta:
+        return
+    meta_sklearn = meta.get("sklearn_version")
+    if meta_sklearn and meta_sklearn != sklearn.__version__:
+        logger.warning(
+            "Model sklearn_version mismatch model=%s runtime=%s",
+            meta_sklearn,
+            sklearn.__version__,
+        )
+    meta_features = meta.get("features")
+    if meta_features and meta_features != FEATURE_COLS:
+        logger.warning(
+            "Model features differ from code features model=%s code=%s",
+            meta_features,
+            FEATURE_COLS,
+        )
+
+
+def collect_predict_warnings(raw_row: pd.Series, derived_row: pd.Series) -> list[str]:
+    warnings: list[str] = []
+    seed_count = raw_row.get("seed_count")
+    pond_size = raw_row.get("pond_size")
+    last_remaining = raw_row.get("last_remaining_count")
+    last_death = raw_row.get("last_death_count")
+
+    if pd.isna(seed_count) or seed_count <= 0:
+        warnings.append("seed_count<=0")
+    if pd.isna(pond_size) or pond_size <= 0:
+        warnings.append("pond_size<=0")
+    if not pd.isna(last_remaining) and not pd.isna(seed_count) and last_remaining > seed_count:
+        warnings.append("last_remaining_count>seed_count")
+    if not pd.isna(last_death) and not pd.isna(seed_count) and last_death > seed_count:
+        warnings.append("last_death_count>seed_count")
+
+    for rate_name in ["mortality_rate", "survival_rate"]:
+        rate = derived_row.get(rate_name)
+        if not pd.isna(rate) and (rate < 0 or rate > 1):
+            warnings.append(f"{rate_name} out_of_range")
+
+    return warnings
+
+
 def build_pipeline() -> Pipeline:
     """
     Regularized Linear Regression with numeric imputation.
@@ -225,6 +270,7 @@ def load_model() -> tuple[Pipeline, dict]:
     pipe = joblib.load(MODEL_PATH)
     with open(META_PATH, "r", encoding="utf-8") as f:
         meta = json.load(f)
+    log_model_environment(meta)
     return pipe, meta
 
 
@@ -245,6 +291,14 @@ def train():
     X = prepare_features(df)
     y = df[TARGET_COL].copy()
 
+    logger.info(
+        "Training dataset rows=%s end_date_range=%s..%s",
+        len(df),
+        df["end_date"].min(),
+        df["end_date"].max(),
+    )
+    logger.info("Training feature_missing=%s", X.isna().sum().to_dict())
+
     # Time-aware split for metrics
     test_size = max(2, int(len(df) * 0.2))
     train_size = len(df) - test_size
@@ -256,6 +310,9 @@ def train():
 
     preds = pipe.predict(X_test)
     metrics = evaluate(y_test, preds)
+    selected_alpha = getattr(pipe.named_steps["model"], "alpha_", None)
+    if selected_alpha is not None:
+        logger.info("Training selected_alpha=%s", selected_alpha)
 
     model_version = f"lr_profit_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}"
 
@@ -266,6 +323,7 @@ def train():
         "features": FEATURE_COLS,
         "target": TARGET_COL,
         "metrics": metrics,
+        "sklearn_version": sklearn.__version__,
     }
 
     save_model(pipe, meta)
@@ -297,8 +355,28 @@ def predict(req: PredictRequest):
     X = prepare_features(feat_df)
     yhat = float(pipe.predict(X)[0])
 
-    features_used = {col: (None if pd.isna(X.iloc[0][col]) else float(X.iloc[0][col]))
-                     for col in FEATURE_COLS}
+    raw_features = feat_df.iloc[0].to_dict()
+    derived_row = X.iloc[0]
+    features_used = {
+        col: (None if pd.isna(derived_row[col]) else float(derived_row[col]))
+        for col in FEATURE_COLS
+    }
+    logger.info("Predict input raw cycle_id=%s raw_features=%s", req.cycle_id, raw_features)
+
+    predict_warnings = collect_predict_warnings(feat_df.iloc[0], derived_row)
+    if predict_warnings:
+        logger.warning(
+            "Predict input anomalies cycle_id=%s issues=%s",
+            req.cycle_id,
+            predict_warnings,
+        )
+    missing_features = derived_row.isna()
+    if missing_features.any():
+        logger.warning(
+            "Predict input missing derived features cycle_id=%s missing=%s",
+            req.cycle_id,
+            list(missing_features[missing_features].index),
+        )
 
     logger.info(
         "Predict success cycle_id=%s model_version=%s predicted_profit=%.4f features_used=%s",
